@@ -55,13 +55,13 @@ def mexc_klines(symbol, start_ms, end_ms, interval="1d"):
     data = r.json()
     if not data:
         return pd.DataFrame(columns=["time","open","high","low","close","volume","quote_volume"])
+    # MEXC Spot returns 8 fields per candle; some API variants return 12.
+    # Read the common first eight fields and ignore any extra metadata.
+    if not isinstance(data, list) or any(not isinstance(row, list) or len(row) < 8 for row in data):
+        raise ValueError("Nieoczekiwany format świec MEXC (klines).")
     df = pd.DataFrame(
-        data,
-        columns=[
-            "time","open","high","low","close","volume",
-            "close_time","quote_volume","trades","taker_base",
-            "taker_quote","ignore"
-        ],
+        [row[:8] for row in data],
+        columns=["time", "open", "high", "low", "close", "volume", "close_time", "quote_volume"],
     )
     for c in ["open","high","low","close","volume","quote_volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
