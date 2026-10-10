@@ -12,7 +12,7 @@ MEXC_BASE = "https://api.mexc.com"
 TIMEOUT = 15
 
 st.set_page_config(
-    page_title="MEXC Breakout Radar v1.2",
+    page_title="MEXC Breakout Radar v1.3",
     page_icon="🚀",
     layout="wide",
 )
@@ -372,6 +372,102 @@ def analyze_symbol(symbol, days=49):
     }, closed
 
 # -----------------------------
+# Newly listed pairs: adaptive 3–49-day model
+# -----------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def listing_history(symbol):
+    """Oldest observed daily candle in a 100-day lookback, NOT official listing date."""
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=100)
+    df = mexc_klines(symbol, int(start.timestamp()*1000), int(now.timestamp()*1000), "1d")
+    if df.empty:
+        return df, None, False
+    df = df.sort_values("time").drop_duplicates("time")
+    first = df.iloc[0]["time"].to_pydatetime()
+    # If history reaches the beginning of the requested window, we cannot date the listing.
+    left_censored = first <= start + timedelta(days=2)
+    return df, first, left_censored
+
+def young_analysis(symbol, min_age=3, max_age=49):
+    df, first, censored = listing_history(symbol)
+    if first is None:
+        return None, "brak świec"
+    now = datetime.now(timezone.utc)
+    # Age in UTC calendar days; the first day can be partial.
+    age = (now.date() - first.date()).days
+    if censored or age > max_age or age < min_age:
+        return None, "poza zakresem lub niepewna historia"
+    today = pd.Timestamp.now(tz="UTC").normalize()
+    closed = df[df["time"] < today].copy()
+    if len(closed) < 2:
+        return None, "za mało zamkniętych świec"
+    # No fake 7D/49D comparisons for pairs with fewer than 7/14/49 candles.
+    w = closed.tail(49)
+    price = float(w.iloc[-1]["close"])
+    if price <= 0:
+        return None, "niepoprawna cena"
+    n = len(w)
+    recent_n = min(3, max(1, n // 2))
+    prev_n = min(recent_n, n - recent_n)
+    recent = w.iloc[-recent_n:]
+    previous = w.iloc[-recent_n-prev_n:-recent_n]
+    recent_avg = float(recent["quote_volume"].mean())
+    prev_avg = float(previous["quote_volume"].mean()) if len(previous) else np.nan
+    short_vol_ratio = recent_avg / prev_avg if prev_avg > 0 else np.nan
+    last_vol = float(w.iloc[-1]["quote_volume"])
+    baseline = float(w.iloc[:-1]["quote_volume"].mean()) if n > 1 else np.nan
+    day_ratio = last_vol / baseline if baseline > 0 else np.nan
+    change = (price / float(w.iloc[0]["close"]) - 1) * 100
+    high = float(w["high"].max())
+    low = float(w["low"].min())
+    dist_high = (price / high - 1) * 100 if high > 0 else np.nan
+    low_slope = linear_slope(w.tail(min(14,n))["low"].values)
+    low_trend = low_slope / price * 100 * min(14,n) if np.isfinite(low_slope) else np.nan
+    max_run = (float(w["close"].max()) / float(w.iloc[0]["close"]) - 1) * 100
+    # Adaptive score: volume, price structure, extension, evidence strength.
+    score = 15.0
+    if np.isfinite(short_vol_ratio):
+        score += max(0, min(27, (short_vol_ratio - 0.8) * 14))
+    if np.isfinite(day_ratio) and 1.5 <= day_ratio <= 6:
+        score += 8
+    if np.isfinite(low_trend) and low_trend > 0:
+        score += 13
+    if -25 <= dist_high <= -2:
+        score += 12
+    elif -2 < dist_high <= 0:
+        score += 5
+    if -10 <= change <= 35:
+        score += 13
+    elif change > 60:
+        score -= min(25, (change - 60) * 0.3 + 8)
+    if max_run > 100:
+        score -= min(20, (max_run - 100) * 0.12 + 5)
+    if np.isfinite(day_ratio) and day_ratio >= 8 and change > 30:
+        score -= 15
+    # Less evidence = less confidence, not artificially low probability.
+    confidence = "niska" if n < 7 else "umiarkowana" if n < 14 else "wyższa (nadal spekulacyjna)"
+    if n < 7:
+        score = min(score, 72)
+    elif n < 14:
+        score = min(score, 82)
+    score = float(np.clip(score, 0, 100))
+    warnings = []
+    if n < 7: warnings.append("mniej niż 7 pełnych świec")
+    if change > 60: warnings.append("duży wzrost ceny od debiutu")
+    if np.isfinite(day_ratio) and day_ratio >= 8: warnings.append("jednodniowy skok wolumenu")
+    if recent_avg < 100_000: warnings.append("niski obrót")
+    return {
+        "symbol":symbol, "first_candle":first.date().isoformat(), "age_days":age,
+        "closed_days":n, "price":price, "quote_volume_24h":last_vol,
+        "short_volume_ratio":short_vol_ratio, "day_volume_ratio":day_ratio,
+        "change_since_first":change, "distance_high":dist_high,
+        "high":high, "low":low, "low_trend":low_trend,
+        "score":score, "confidence":confidence,
+        "warnings":"; ".join(warnings) if warnings else "brak podstawowych flag",
+        "data":w,
+    }, None
+
+# -----------------------------
 # Sidebar
 # -----------------------------
 with st.sidebar:
@@ -399,12 +495,43 @@ with st.sidebar:
 # Manual analysis
 # -----------------------------
 st.subheader("🧪 Oceń dowolną kryptowalutę z MEXC")
+manual_mode = st.radio(
+    "Tryb analizy ręcznej",
+    ["Standardowy (30+ dni)", "Nowa para (3–49 dni)"],
+    horizontal=True,
+    help="Nowa para korzysta z krótszych okien, a nie z fikcyjnych 7-tygodniowych danych."
+)
 manual = st.text_input(
     "Wpisz symbol pary",
     placeholder="np. GRVTUSDT, HOMEUSDT, XDPUSDT",
 ).strip().upper()
 
-if manual:
+if manual and manual_mode == "Nowa para (3–49 dni)":
+    with st.spinner(f"Sprawdzam historię {manual}..."):
+        try:
+            result, reason = young_analysis(manual)
+            if result is None:
+                st.warning(f"Nie można ocenić jako nowej pary: {reason}. Możliwe, że para jest starsza niż 49 dni lub ma niepełną historię API.")
+            else:
+                st.success(f"Pierwsza dostępna świeca MEXC: {result['first_candle']} · szacowany wiek: {result['age_days']} dni · {result['closed_days']} zamkniętych świec")
+                st.caption("Pierwsza świeca jest przybliżeniem daty startu handlu, a nie oficjalną datą listingu. W razie wątpliwości sprawdź komunikat MEXC.")
+                a,b,c,d = st.columns(4)
+                a.metric("Score młodej pary",f"{result['score']:.0f}/100")
+                b.metric("Wolumen 24h (zamknięty dzień)",fmt_money(result['quote_volume_24h']))
+                c.metric("Wolumen ostatnich dni / wcześniejsze",f"{result['short_volume_ratio']:.2f}×" if np.isfinite(result['short_volume_ratio']) else "—")
+                d.metric("Zmiana od pierwszej świecy",pct(result['change_since_first']))
+                st.write(f"**Wiarygodność sygnału:** {result['confidence']} · **Ryzyka:** {result['warnings']}")
+                st.write(f"Szczyt: `{result['high']:.10g}` · Do szczytu: `{result['distance_high']:.1f}%` · +200% od obecnej ceny: `{result['price']*3:.10g}` · +300%: `{result['price']*4:.10g}`")
+                st.line_chart(result['data'].set_index('time')['close'])
+                cg_young = cg_enrich_symbols([manual])
+                if not cg_young.empty:
+                    x = cg_young.iloc[0]
+                    st.write(f"Market cap: **{fmt_money(x.get('market_cap'))}** · FDV: **{fmt_money(x.get('fdv'))}** · Fundamental proxy: **{fundamental_score(x):.0f}/25**")
+                st.caption("Score jest heurystyką, nie prawdopodobieństwem wzrostu +200%/+300%. Nieznane unlocki i tokenomia wymagają osobnego sprawdzenia.")
+        except Exception as e:
+            st.error(f"Nie udało się pobrać danych nowej pary: {e}")
+
+if manual and manual_mode == "Standardowy (30+ dni)":
     with st.spinner(f"Analizuję {manual}..."):
         try:
             result, df = analyze_symbol(manual, 49)
@@ -534,7 +661,7 @@ with st.expander("Otwórz checklistę fundamentalną dla wybranej monety", expan
     st.download_button(
         "⬇️ Pobierz checklistę fundamentalną jako TXT",
         data=(
-            f"MEXC Breakout Radar v1.2 — checklista\nOcena fundamentalna: {manual_fundamental_score:.1f}/100\n"
+            f"MEXC Breakout Radar v1.3 — checklista\nOcena fundamentalna: {manual_fundamental_score:.1f}/100\n"
             f"Zespół: {team_rating}/5\nProdukt: {product_rating}/5\nTrakcja: {traction_rating}/5\n"
             f"Społeczność/narracja: {community_rating}/5\nTokenomia: {tokenomics_rating}/5\n"
             f"Transparentność/bezpieczeństwo: {transparency_rating}/5\nUnlock 30D (% obiegu): {unlock_pct_30d}\n"
@@ -543,6 +670,64 @@ with st.expander("Otwórz checklistę fundamentalną dla wybranej monety", expan
         file_name="mexc_fundamental_checklist.txt",
         mime="text/plain",
     )
+
+# -----------------------------
+# Separate scanner for 3–49 day MEXC pairs
+# -----------------------------
+st.divider()
+st.subheader("🆕 Osobny skaner nowych par MEXC (3–49 dni)")
+st.caption("Wiek pary szacowany z najstarszej dostępnej świecy dziennej MEXC w 100-dniowym oknie. To NIE jest oficjalna data listingu. Skan dotyczy par spot USDT; nie obejmuje automatycznie wszystkich par giełdy.")
+with st.expander("⚙️ Filtry młodych par", expanded=True):
+    y1,y2 = st.columns(2)
+    with y1:
+        young_min = st.slider("Minimalny wiek (dni)",3,48,3)
+        young_max = st.slider("Maksymalny wiek (dni)",young_min+1,49,49)
+        young_count = st.slider("Liczba par do sprawdzenia (według obrotu)",30,500,200,10)
+    with y2:
+        young_min_vol = st.number_input("Min. wolumen 24h USDT (nowe pary)",min_value=0.0,value=30_000.0,step=10_000.0)
+        young_min_ratio = st.slider("Min. wzrost krótkoterminowego wolumenu",0.0,5.0,1.0,0.1)
+        young_max_gain = st.slider("Maks. wzrost od pierwszej świecy (%)",10,500,100,10)
+    young_scan = st.button("🆕 Skanuj pary 3–49 dni",type="primary",use_container_width=True)
+if young_scan:
+    try:
+        tick = mexc_tickers()
+        if "symbol" not in tick.columns:
+            raise ValueError("Brak symboli w odpowiedzi MEXC")
+        tick = tick[tick["symbol"].astype(str).str.endswith("USDT")].copy()
+        tick["quoteVolume"] = pd.to_numeric(tick.get("quoteVolume"),errors="coerce")
+        tick = tick[tick["quoteVolume"] >= young_min_vol]
+        # Scan by volume, but do not falsely claim this covers all listings.
+        tick = tick.sort_values("quoteVolume",ascending=False).head(young_count)
+        ex = mexc_exchange_info()
+        if not ex.empty and {"symbol","status"}.issubset(ex.columns):
+            active = ex[ex["status"].astype(str).str.upper().isin(["1","ENABLED","TRADING"])]["symbol"]
+            if len(active):
+                tick = tick[tick["symbol"].isin(active)]
+        results=[]
+        errors=0
+        prog=st.progress(0)
+        total=len(tick)
+        for i,sym in enumerate(tick["symbol"],1):
+            try:
+                r,_=young_analysis(sym,young_min,young_max)
+                if r and r["quote_volume_24h"] >= young_min_vol and r["change_since_first"] <= young_max_gain and np.isfinite(r["short_volume_ratio"]) and r["short_volume_ratio"] >= young_min_ratio:
+                    results.append(r)
+            except Exception:
+                errors+=1
+            prog.progress(i/max(1,total))
+        prog.empty()
+        st.info(f"Sprawdzono {total} par z największym obrotem. Dopasowano: {len(results)}. Nieudane zapytania: {errors}. Wiek to estymacja z danych świec.")
+        if results:
+            out=pd.DataFrame([{k:v for k,v in r.items() if k!="data"} for r in results]).sort_values(["score","short_volume_ratio"],ascending=False)
+            show=out[["symbol","age_days","first_candle","closed_days","score","confidence","quote_volume_24h","short_volume_ratio","change_since_first","distance_high","warnings"]].copy()
+            show.columns=["Para","Wiek (dni)","Pierwsza świeca","Pełne świece","Score","Pewność","Wolumen 24h","Wolumen krótki ×","Zmiana od startu %","Od szczytu %","Ryzyka"]
+            st.dataframe(show,use_container_width=True,hide_index=True)
+            st.download_button("⬇️ Pobierz nowe pary CSV",out.to_csv(index=False).encode("utf-8"),file_name="mexc_new_pairs_3_49_days.csv",mime="text/csv")
+            st.caption("Dla 3–6 dni nie ma pełnego tygodnia danych; stosujemy porównanie krótszych okien i ograniczamy maksymalny score. Przy niskim wolumenie wyniki są szczególnie niepewne.")
+        else:
+            st.warning("Brak dopasowań. Zwiększ liczbę sprawdzanych par lub zmniejsz próg wolumenu/wzrostu.")
+    except Exception as e:
+        st.error(f"Nie udało się przeskanować nowych par: {e}")
 
 # -----------------------------
 # Full scan
