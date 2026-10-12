@@ -12,7 +12,7 @@ MEXC_BASE = "https://api.mexc.com"
 TIMEOUT = 15
 
 st.set_page_config(
-    page_title="MEXC Breakout Radar v1.3",
+    page_title="MEXC Breakout Radar v1.4",
     page_icon="🚀",
     layout="wide",
 )
@@ -661,7 +661,7 @@ with st.expander("Otwórz checklistę fundamentalną dla wybranej monety", expan
     st.download_button(
         "⬇️ Pobierz checklistę fundamentalną jako TXT",
         data=(
-            f"MEXC Breakout Radar v1.3 — checklista\nOcena fundamentalna: {manual_fundamental_score:.1f}/100\n"
+            f"MEXC Breakout Radar v1.4 — checklista\nOcena fundamentalna: {manual_fundamental_score:.1f}/100\n"
             f"Zespół: {team_rating}/5\nProdukt: {product_rating}/5\nTrakcja: {traction_rating}/5\n"
             f"Społeczność/narracja: {community_rating}/5\nTokenomia: {tokenomics_rating}/5\n"
             f"Transparentność/bezpieczeństwo: {transparency_rating}/5\nUnlock 30D (% obiegu): {unlock_pct_30d}\n"
@@ -882,3 +882,137 @@ st.caption(
     "DefiLlama TVL działa po ręcznym dopasowaniu slugiem; unlocki, team, newsy i social nie są automatycznie zweryfikowane. "
     "Przed transakcją sprawdź źródła projektu i dane bezpośrednio na giełdzie."
 )
+
+
+# =============================================================
+# Futures LONG watchlist: 24h horizon, NOT a trade prediction.
+# =============================================================
+st.divider()
+st.header("📈 Futures LONG — lista obserwacyjna na kolejne 24 godziny")
+st.warning("Nie istnieją sygnały LONG o 100% pewności. Ranking pokazuje warunkowe setupy do obserwacji, a nie gwarantowane transakcje. Futures i dźwignia mogą spowodować szybką utratę kapitału.")
+
+@st.cache_data(ttl=120, show_spinner=False)
+def futures_tickers():
+    r = requests.get("https://contract.mexc.com/api/v1/contract/ticker", timeout=TIMEOUT)
+    r.raise_for_status()
+    payload = r.json()
+    if not payload.get("success", False):
+        raise ValueError("API futures nie zwróciło poprawnych danych")
+    data = payload.get("data", [])
+    return data if isinstance(data, list) else [data]
+
+def finite_num(value):
+    try:
+        n = float(value)
+        return n if math.isfinite(n) else float("nan")
+    except (TypeError, ValueError):
+        return float("nan")
+
+def long_candidate(symbol, fut, group):
+    if group == "Młode (3–49 dni)":
+        analysis, _ = young_analysis(symbol)
+        if analysis is None:
+            return None
+        tech = analysis["score"]
+        age = analysis["age_days"]
+        risk = analysis["warnings"]
+        volume = analysis["quote_volume_24h"]
+        dist = analysis["distance_high"]
+        momentum = analysis["change_since_first"]
+        if analysis["closed_days"] < 7:
+            risk += "; bardzo mała próba danych"
+    else:
+        # Reject pairs that are confirmed young; exclude unknown age to avoid mixing cohorts.
+        hist, first, censored = listing_history(symbol)
+        if first is None or not censored and (datetime.now(timezone.utc).date() - first.date()).days <= 49:
+            return None
+        analysis, _ = analyze_symbol(symbol)
+        if analysis is None:
+            return None
+        tech = analysis["score"]
+        age = "50+ / starsza historia"
+        risk = ""
+        volume = analysis["quote_volume_24h"]
+        dist = analysis["distance_high"]
+        momentum = analysis["change_7w"]
+    funding = finite_num(fut.get("fundingRate"))
+    spread_bid = finite_num(fut.get("bid1"))
+    spread_ask = finite_num(fut.get("ask1"))
+    spread_pct = (spread_ask / spread_bid - 1) * 100 if spread_bid > 0 and spread_ask >= spread_bid else float("nan")
+    turnover = finite_num(fut.get("amount24"))
+    if not math.isfinite(turnover) or turnover < futures_min_turnover:
+        return None
+    if not math.isfinite(spread_pct) or spread_pct > futures_max_spread:
+        return None
+    if not math.isfinite(funding):
+        return None
+    if funding > futures_max_funding / 100:
+        return None
+    if volume < min_quote:
+        return None
+    # Heuristic score, not a probability. Favor volume/structure; penalize crowded longs.
+    penalty = max(0, funding * 10000) * 1.5 + max(0, spread_pct - 0.1) * 8
+    score = round(max(0, min(100, tech - penalty)), 1)
+    if score < futures_min_score:
+        return None
+    return {"Para spot":symbol, "Kontrakt futures":fut.get("symbol"),
+            "Ranking / 100":score, "Wiek spot (dni)":age,
+            "Obrót futures 24h (USDT)":round(turnover),
+            "Funding (%)":round(funding * 100, 4),
+            "Spread (%)":round(spread_pct, 3),
+            "Zmiana okresu (%)":round(momentum, 1),
+            "Od szczytu (%)":round(dist, 1),
+            "Ostrzeżenia":risk or "brak dodatkowych flag"}
+
+with st.expander("⚙️ Filtry sygnałów LONG 24h", expanded=True):
+    futures_limit = st.slider("Ile płynnych kontraktów sprawdzić?", 10, 100, 35, 5)
+    futures_min_turnover = st.number_input("Min. obrót futures 24h (USDT)", min_value=0.0, value=1_000_000.0, step=500_000.0)
+    futures_max_spread = st.slider("Maksymalny spread bid/ask (%)", 0.05, 3.0, 0.5, 0.05)
+    futures_max_funding = st.slider("Maksymalny dodatni funding (%)", 0.0, 0.5, 0.1, 0.01)
+    futures_min_score = st.slider("Minimalny ranking setupu (nie prawdopodobieństwo)", 0, 100, 55, 5)
+    futures_run = st.button("🔍 Szukaj setupów LONG na 24h", type="primary")
+
+if futures_run:
+    try:
+        with st.spinner("Pobieram kontrakty i sprawdzam historię spot. Może to potrwać kilka minut..."):
+            futures = futures_tickers()
+            candidates = []
+            for f in futures:
+                name = str(f.get("symbol", ""))
+                if not name.endswith("_USDT"):
+                    continue
+                spot_symbol = name.replace("_", "")
+                amount = finite_num(f.get("amount24"))
+                if math.isfinite(amount) and amount >= futures_min_turnover:
+                    candidates.append((amount, spot_symbol, f))
+            candidates.sort(key=lambda item:item[0], reverse=True)
+            candidates = candidates[:futures_limit]
+            young, older = [], []
+            progress = st.progress(0)
+            for i, (_, sym, f) in enumerate(candidates):
+                try:
+                    hist, first, censored = listing_history(sym)
+                    if first is None:
+                        continue
+                    age_days = (datetime.now(timezone.utc).date() - first.date()).days
+                    group = "Młode (3–49 dni)" if not censored and 3 <= age_days <= 49 else "Starsze (50+ dni)" if censored or age_days > 49 else None
+                    if group:
+                        item = long_candidate(sym, f, group)
+                        if item:
+                            (young if group.startswith("Młode") else older).append(item)
+                except (requests.RequestException, ValueError, KeyError, TypeError, IndexError):
+                    pass
+                finally:
+                    progress.progress((i + 1) / max(1, len(candidates)))
+        st.caption("Godzina odświeżenia (UTC): " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M") + " • Ranking heurystyczny, bez walidacji skuteczności i bez automatycznych zleceń.")
+        for title, rows in [("🆕 Młode pary spot: 3–49 dni",young),("🏛️ Starsze pary spot: 50+ dni",older)]:
+            st.subheader(title)
+            if rows:
+                table = pd.DataFrame(rows).sort_values("Ranking / 100", ascending=False)
+                st.dataframe(table, use_container_width=True, hide_index=True)
+                st.download_button("⬇️ Pobierz CSV — " + title, table.to_csv(index=False).encode("utf-8"), file_name=("long_young" if rows is young else "long_older") + ".csv", mime="text/csv")
+            else:
+                st.info("Brak kandydatów spełniających filtry wśród sprawdzonych kontraktów. To prawidłowy wynik — nie wymuszamy sygnału.")
+        st.info("Przed ewentualnym wejściem sprawdź wykres 1h/4h, głębokość zleceń, funding, publikacje i poziom unieważnienia setupu. Wynik nie wyznacza wejścia, stop-loss ani dźwigni.")
+    except Exception as exc:
+        st.error("Nie udało się pobrać listy futures: " + str(exc))
